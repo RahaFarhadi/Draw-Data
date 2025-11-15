@@ -72,7 +72,7 @@ class Program
         }
 
         // Fallback to historical defaults for backward compatibility.
-        var dxfPath = Environment.GetEnvironmentVariable("DXF_PATH") ?? "C:/tmp/sample-dxf.dxf";
+        var dxfPath = Environment.GetEnvironmentVariable("DXF_PATH") ?? "C:/tmp/test2-a.dxf";
         var mappingPath = Environment.GetEnvironmentVariable("MAPPING_PATH") ??
                           "C:/Users/Digibod.ir/source/repos/dxf-ext/dxf-ext/mapping.json";
         return (dxfPath, mappingPath);
