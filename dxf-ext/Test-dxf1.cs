@@ -1,375 +1,401 @@
-﻿using System;
+using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Globalization;
 using System.IO;
 using System.Linq;
-using System.Data;
+using System.Text;
 using System.Text.Json;
-using System.Collections;
-using System.Collections.Generic;
-using System.Reflection;
-using netDxf;
+using System.Text.RegularExpressions;
 using ClosedXML.Excel;
-using System.Globalization;
-using System.Text.RegularExpressions; // Added for pattern matching
+using netDxf;
+/// <summary>
+/// Represents a single column mapping entry coming from mapping.json.
+/// </summary>
+class MappingColumn
+{
+    public string col { get; set; } = string.Empty;
+    public string? attr { get; set; }
+    public string? source { get; set; }
+}
 
-class MappingColumn { public string col { get; set; } public string attr { get; set; } public string source { get; set; } }
-class Mapping { public List<MappingColumn> columns { get; set; } }
-
+/// <summary>
+/// Root object for mapping.json.
+/// </summary>
+class Mapping
+{
+    public List<MappingColumn> columns { get; set; } = new();
+}
 class Program
 {
+    private static readonly HashSet<string> SingleCharColors = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "R", "B", "Y", "L", "W", "G", "V", "O", "P", "S", "T", "BR", "GR", "PI", "LB", "VI", "GY"
+    };
+
+    private static readonly string[] WireTypePatterns =
+    {
+        "AVSS", "AVS", "FLRY", "T1", "T2", "T3", "T4", "GPT", "CAVS"
+    };
     static void Main(string[] args)
     {
-        Console.OutputEncoding = System.Text.Encoding.UTF8;
-        string dxfPath = "C:\\tmp\\sample-dxf.dxf";
-        string mappingPath = "C:\\Users\\Digibod.ir\\source\\repos\\dxf-ext\\dxf-ext\\mapping.json";
+        Console.OutputEncoding = Encoding.UTF8;
 
-        if (!File.Exists(dxfPath)) { Console.WriteLine($"ERROR: DXF file not found: {dxfPath}"); return; }
-        if (!File.Exists(mappingPath)) { Console.WriteLine($"ERROR: mapping.json not found: {mappingPath}"); return; }
+        var (dxfPath, mappingPath) = ResolvePaths(args);
+        if (!ValidateInputFiles(dxfPath, mappingPath)) return;
 
-        Mapping mapping = JsonSerializer.Deserialize<Mapping>(File.ReadAllText(mappingPath));
+        var mapping = LoadMapping(mappingPath);
+        if (mapping.columns.Count == 0)
+        {
+            Console.WriteLine("ERROR: mapping.json does not contain any columns.");
+            return;
+        }
 
-        // Load DXF
-        DxfDocument dxf = null;
+        var dxf = LoadDxf(dxfPath);
+        if (dxf is null) return;
+
+        var table = CreateWireTable(mapping);
+
+        if (!TryExtractFromInserts(dxf, table, mapping))
+        {
+            Console.WriteLine("⚠️ No structured attribute data found. Falling back to parsing Text/MText entities.");
+            ParseTextEntities(dxf, table);
+        }
+
+        SaveToExcel(table, Path.Combine(Path.GetDirectoryName(dxfPath) ?? ".", "output.xlsx"));
+    }
+    private static (string dxfPath, string mappingPath) ResolvePaths(string[] args)
+    {
+        if (args.Length >= 2)
+        {
+            return (args[0], args[1]);
+        }
+
+        // Fallback to historical defaults for backward compatibility.
+        var dxfPath = Environment.GetEnvironmentVariable("DXF_PATH") ?? "C:/tmp/sample-dxf.dxf";
+        var mappingPath = Environment.GetEnvironmentVariable("MAPPING_PATH") ??
+                          "C:/Users/Digibod.ir/source/repos/dxf-ext/dxf-ext/mapping.json";
+        return (dxfPath, mappingPath);
+    }
+
+    private static bool ValidateInputFiles(string dxfPath, string mappingPath)
+    {
+        if (!File.Exists(dxfPath))
+        {
+            Console.WriteLine($"ERROR: DXF file not found: {dxfPath}");
+            return false;
+        }
+
+        if (!File.Exists(mappingPath))
+        {
+            Console.WriteLine($"ERROR: mapping.json not found: {mappingPath}");
+            return false;
+        }
+
+        return true;
+    }
+
+    // Load DXF
+    private static Mapping LoadMapping(string mappingPath)
+    {
+        var json = File.ReadAllText(mappingPath);
+        var mapping = JsonSerializer.Deserialize<Mapping>(json) ?? new Mapping();
+        mapping.columns = mapping.columns
+            .Where(c => !string.IsNullOrWhiteSpace(c.col))
+            .ToList();
+        return mapping;
+    }
+
+    private static DxfDocument? LoadDxf(string dxfPath)
+    {
         try
         {
-            dxf = DxfDocument.Load(dxfPath);
-            Console.WriteLine($"✅ DXF loaded. Entities count: {dxf.Entities.All.Count()}");
+            var document = DxfDocument.Load(dxfPath);
+            Console.WriteLine($"✅ DXF loaded. Entities count: {document.Entities.All.Count()}");
+            return document;
         }
         catch (Exception ex)
         {
             Console.WriteLine($"ERROR loading DXF: {ex.Message}");
-            return;
+            return null;
         }
+    }
 
-        // Utility: get enumerable from a possible property or method using reflection
-        IEnumerable SafeGetEnumerable(object owner, string memberName)
-        {
-            // ... (Your existing SafeGetEnumerable method remains the same) ...
-            if (owner == null) return Enumerable.Empty<object>();
-
-            var t = owner.GetType();
-
-            // Try property
-            var prop = t.GetProperty(memberName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase);
-            if (prop != null)
-            {
-                var val = prop.GetValue(owner);
-                if (val is IEnumerable e) return e.Cast<object>();
-            }
-
-            // Try method (no parameters)
-            var m = t.GetMethod(memberName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase, null, Type.EmptyTypes, null);
-            if (m != null)
-            {
-                var val = m.Invoke(owner, null);
-                if (val is IEnumerable e2) return e2.Cast<object>();
-            }
-
-            // Try field (rare)
-            var field = t.GetField(memberName, BindingFlags.Instance | BindingFlags.Public | BindingFlags.IgnoreCase);
-            if (field != null)
-            {
-                var val = field.GetValue(owner);
-                if (val is IEnumerable e3) return e3.Cast<object>();
-            }
-
-            return Enumerable.Empty<object>();
-        }
-
-        var entitiesEnum = SafeGetEnumerable(dxf, "Entities") ?? Enumerable.Empty<object>();
-        int entitiesCount = entitiesEnum.Cast<object>().Count();
-        Console.WriteLine($"DXF loaded. Entities count: {entitiesCount}");
-
+    // Utility: get enumerable from a possible property or method using reflection
+    private static DataTable CreateWireTable(Mapping mapping)
+    {
         var table = new DataTable("Wires");
-        foreach (var mc in mapping.columns) table.Columns.Add(mc.col);
+        foreach (var column in mapping.columns)
+        {
+            if (!table.Columns.Contains(column.col))
+            {
+                table.Columns.Add(column.col);
+            }
+        }
+        return table;
+    }
 
-        int idx = 1;
-        bool dataExtractedFromInserts = false;
-
-        // Try extracting from Inserts/Attributes first (best method)
+    private static bool TryExtractFromInserts(DxfDocument dxf, DataTable table, Mapping mapping)
+    {
         var inserts = dxf.Entities.All.OfType<netDxf.Entities.Insert>().ToList();
+        if (!inserts.Any()) return false;
 
-        if (inserts.Count > 0)
+        var indexColumn = mapping.columns.FirstOrDefault(c => c.source == "auto_index")?.col;
+        var targetColumns = mapping.columns.Where(c => !string.IsNullOrEmpty(c.attr)).ToList();
+        if (!targetColumns.Any()) return false;
+
+        var addedRows = 0;
+        foreach (var insert in inserts)
         {
-            // The existing Insert/Attribute extraction logic (commented out in your original code)
-            // should be uncommented and validated here. For now, we assume it's still bypassed
-            // or the Attributes are empty, leading to the fallback.
+            var attributes = insert.Attributes.ToList();
+            if (attributes.Count == 0) continue;
 
-            // Re-enabling the core logic for Insert extraction:
-            foreach (var insObj in inserts)
+            var row = table.NewRow();
+            foreach (DataColumn column in table.Columns) row[column.ColumnName] = string.Empty;
+
+            if (!string.IsNullOrEmpty(indexColumn))
             {
-                var attributes = insObj.Attributes.ToList(); // Insert.Attributes has netDxf.Entities.Attribute instances (values)
+                row[indexColumn] = (addedRows + 1).ToString(CultureInfo.InvariantCulture);
+            }
 
-                // You were printing the attribute tags/values for debugging, which is good.
-
-                if (attributes.Count > 0)
+            foreach (var column in targetColumns)
+            {
+                var attribute = attributes.FirstOrDefault(a =>
+                    string.Equals(a.Tag, column.attr, StringComparison.OrdinalIgnoreCase));
+                if (attribute != null)
                 {
-                    dataExtractedFromInserts = true;
-                    var row = table.NewRow();
-
-                    // Initialize row with empty strings
-                    foreach (DataColumn column in table.Columns) row[column.ColumnName] = "";
-
-                    foreach (var mc in mapping.columns)
-                    {
-                        if (mc.source == "auto_index")
-                        {
-                            row[mc.col] = idx;
-                            continue;
-                        }
-                        if (!string.IsNullOrEmpty(mc.attr))
-                        {
-                            // Find the attribute by Tag (case-insensitive)
-                            var attribute = attributes.FirstOrDefault(a =>
-                                string.Equals(a.Tag, mc.attr, StringComparison.OrdinalIgnoreCase)
-                            );
-
-                            if (attribute != null)
-                            {
-                                row[mc.col] = attribute.Value;
-                            }
-                        }
-                    }
-                    table.Rows.Add(row);
-                    idx++;
+                    row[column.col] = attribute.Value;
                 }
             }
-            if (dataExtractedFromInserts) Console.WriteLine($"✅ Successfully extracted data from {idx - 1} Insert entities.");
+
+            table.Rows.Add(row);
+            addedRows++;
         }
 
-
-        // Fallback Logic: Parsing Text/MText entities
-        if (!dataExtractedFromInserts)
+        if (addedRows > 0)
         {
-            Console.WriteLine("⚠️ No structured attribute data found. Falling back to parsing Text/MText entities.");
+            Console.WriteLine($"✅ Successfully extracted data from {addedRows} Insert entities.");
+            return true;
+        }
 
-            // --- Revised Parsing Definitions ---
-            var singleCharColors = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            {
-                "R", "B", "Y", "L", "W", "G", "V", "O", "P", "S", "T", "BR", "GR", "PI", "LB", "VI", "GY"
-            };
-            var wireTypePatterns = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            {
-                "AVSS", "AVS", "FLRY", "T1", "T2", "T3", "T4", "GPT", "CAVS" // Added common types
-            };
+        return false;
+    }
 
-            // Utility for general noise filtering
-            bool IsNoise(string value)
+    private static void ParseTextEntities(DxfDocument dxf, DataTable table)
+    {
+        var texts = dxf.Entities.All
+            .Where(e => e is netDxf.Entities.Text || e is netDxf.Entities.MText)
+            .Select(entity =>
             {
-                var v = value.ToUpper();
-                // Filter common connector/harness/pin/noise labels
-                if (v.StartsWith("PIN") || v.EndsWith(":") || v.Contains("SEAL") || v.Contains("CLIP") ||
-                    v.Contains("AMP") || v.Contains("YAZAKI") || v.Contains("KET") || v.Contains("KUM") || v.Contains("SWS") ||
-                    v.Contains("NOTE") || v.Contains("SPECIFICATION") || v.Contains("ASSY") || v.Contains("DESCRIPTION"))
+                if (entity is netDxf.Entities.Text text)
                 {
-                    return true;
+                    return (text.Value, text.Position.X, text.Position.Y);
                 }
-                return false;
+                var mtext = (netDxf.Entities.MText)entity;
+                return (mtext.Value, mtext.Position.X, mtext.Position.Y);
+            })
+            .Select(item => (value: CleanText(item.Item1), item.Item2, item.Item3))
+            .Where(item => !string.IsNullOrWhiteSpace(item.value) && !IsNoise(item.value))
+            .ToList();
+
+        Console.WriteLine($"Collected {texts.Count} cleaned text-like entities.");
+
+        var groupedRows = GroupByRow(texts);
+        Console.WriteLine($"Grouped into {groupedRows.Count} rows based on Y coordinate.");
+
+        var idx = 1;
+        foreach (var group in groupedRows)
+        {
+            var row = table.NewRow();
+            foreach (DataColumn column in table.Columns) row[column.ColumnName] = string.Empty;
+
+            if (table.Columns.Contains("رديف"))
+            {
+                row["رديف"] = idx.ToString(CultureInfo.InvariantCulture);
             }
-            // --- End Parsing Definitions ---
+            PopulateRowFromGroup(table, group, row);
 
-            var texts = new List<(string value, double x, double y)>();
-            var textEntities = dxf.Entities.All.Where(e => e is netDxf.Entities.Text || e is netDxf.Entities.MText);
+            table.Rows.Add(row);
+            idx++;
+        }
+    }
+    private static void PopulateRowFromGroup(DataTable table, List<(string value, double x, double y)> group, DataRow row)
+    {
+        var sortedGroup = group.OrderBy(item => item.x).ToList();
+        var rowData = new Dictionary<string, string>();
+        var usedValues = new HashSet<string>();
 
-            foreach (var ent in textEntities)
+
+        // Stage 1: absolute identifiers
+        foreach (var item in sortedGroup)
+        {
+            var value = item.value.Trim().ToUpperInvariant();
+            if (usedValues.Contains(value)) continue;
+
+            if (table.Columns.Contains("رنگ سيم") && !rowData.ContainsKey("رنگ سيم") &&
+                SingleCharColors.Contains(value))
             {
-                string val = null;
-                double x = 0, y = 0;
+                rowData["رنگ سيم"] = value;
+                usedValues.Add(value);
+                continue;
+            }
+            if (!rowData.ContainsKey("نوع سيم"))
+            {
+                var matchedPattern = WireTypePatterns
+                    .OrderByDescending(p => p.Length)
+                    .FirstOrDefault(pattern => value.EndsWith(pattern, StringComparison.OrdinalIgnoreCase));
 
-                if (ent is netDxf.Entities.Text textEntity)
+                if (matchedPattern != null)
                 {
-                    val = textEntity.Value;
-                    x = textEntity.Position.X;
-                    y = textEntity.Position.Y;
-                }
-                else if (ent is netDxf.Entities.MText mTextEntity)
-                {
-                    val = mTextEntity.Value;
-                    x = mTextEntity.Position.X;
-                    y = mTextEntity.Position.Y;
-                }
+                    var sizePart = value[..^matchedPattern.Length].Trim();
+                    var cleanValue = sizePart.Replace(',', '.').Replace(" ", string.Empty);
 
-                if (val != null)
-                {
-                    // Aggressive cleanup: remove DXF formatting codes (\P, \H, \W, etc.) and trim.
-                    var safeVal = Regex.Replace(val, @"\\(P|H|W|S|T|L|O|U|A|C|F)[^;]*;?", "").Trim();
-                    safeVal = safeVal.Replace("\r\n", " ").Replace("\n", " ").Replace("\r", " ").Trim();
-
-                    if (!string.IsNullOrEmpty(safeVal) && !IsNoise(safeVal))
+                    if (double.TryParse(cleanValue, NumberStyles.Float, CultureInfo.InvariantCulture, out var size) &&
+                        size is >= 0.1 and <= 5.0)
                     {
-                        texts.Add((safeVal, x, y));
-                    }
-                }
-            }
-
-            Console.WriteLine($"Collected {texts.Count} cleaned text-like entities.");
-
-            // Simple grouping by Y coordinate (coarse) to create rows
-            var groups = new List<List<(string value, double x, double y)>>();
-            double yTol = 5.0; // **Decreased Y Tolerance for stricter row grouping (adjust based on your DXF)**
-
-            // Sort descending by Y first for consistent row order (top to bottom)
-            foreach (var t in texts.OrderByDescending(t => t.y).ThenBy(t => t.x))
-            {
-                // Find a group whose average Y is close enough
-                var g = groups.FirstOrDefault(gr => gr.Any() && Math.Abs(gr.Average(i => i.y) - t.y) <= yTol);
-                if (g == null) groups.Add(new List<(string, double, double)> { t });
-                else g.Add(t);
-            }
-
-            Console.WriteLine($"Grouped into {groups.Count} rows based on Y coordinate.");
-
-            // Iterate over the grouped rows
-            foreach (var g in groups)
-            {
-                var sortedGroup = g.OrderBy(item => item.x).ToList();
-                var row = table.NewRow();
-
-                // Initialize row with empty strings
-                foreach (DataColumn column in table.Columns) row[column.ColumnName] = "";
-
-                row["رديف"] = idx.ToString();
-
-                var rowData = new Dictionary<string, string>();
-                var usedValues = new HashSet<string>();
-
-                // Stage 1: Absolute Identifiers (Color, Size+Type)
-                foreach (var item in sortedGroup)
-                {
-                    string value = item.value.Trim().ToUpper();
-                    if (usedValues.Contains(value)) continue;
-
-                    // 1. رنگ سيم: (بالاترین اولویت، معمولاً کوتاه و در ابتدا)
-                    if (table.Columns.Contains("رنگ سيم") && !rowData.ContainsKey("رنگ سيم") &&
-                        singleCharColors.Contains(value))
-                    {
-                        rowData["رنگ سيم"] = value;
+                        if (table.Columns.Contains("سايزسيم"))
+                        {
+                            rowData["سايزسيم"] = sizePart;
+                        }
+                        rowData["نوع سيم"] = matchedPattern;
                         usedValues.Add(value);
+                        continue;
                     }
 
-                    // 2. تشخیص ترکیبی سايزسيم و نوع سيم (مثلاً 0.35AVSS)
-                    else if (!rowData.ContainsKey("نوع سيم"))
+                    if (string.IsNullOrEmpty(sizePart))
                     {
-                        bool isWireTypeFound = false;
-                        foreach (var pattern in wireTypePatterns.OrderByDescending(p => p.Length))
-                        {
-                            if (value.EndsWith(pattern))
-                            {
-                                string sizePart = value.Substring(0, value.Length - pattern.Length).Trim();
-                                string cleanValue = sizePart.Replace(',', '.').Replace(" ", string.Empty);
-
-                                // Parse Size
-                                if (double.TryParse(cleanValue, NumberStyles.Float, CultureInfo.InvariantCulture, out double size) &&
-                                    size >= 0.1 && size <= 5.0)
-                                {
-                                    if (table.Columns.Contains("سايزسيم")) rowData["سايزسيم"] = sizePart;
-                                    rowData["نوع سيم"] = pattern;
-                                    usedValues.Add(value);
-                                    isWireTypeFound = true;
-                                    break;
-                                }
-                                // If the value is ONLY the wire type (e.g., AVSS) and no size part
-                                else if (string.IsNullOrEmpty(sizePart) && wireTypePatterns.Contains(value))
-                                {
-                                    rowData["نوع سيم"] = pattern;
-                                    usedValues.Add(value);
-                                    isWireTypeFound = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Stage 2: Length and Single Size (Numbers)
-                foreach (var item in sortedGroup)
-                {
-                    string value = item.value.Trim().ToUpper();
-                    if (usedValues.Contains(value)) continue;
-
-                    // Try to parse as integer (potential length)
-                    if (int.TryParse(value, out int length))
-                    {
-                        // 3. طول برش سيم: (عدد صحیح بزرگ - 50 تا 2500)
-                        if (table.Columns.Contains("طول برش سيم") && !rowData.ContainsKey("طول برش سيم") &&
-                            length >= 50 && length <= 2500)
-                        {
-                            rowData["طول برش سيم"] = value;
-                            usedValues.Add(value);
-                        }
-                    }
-                    // Try to parse as double (potential size - already attempted in Stage 1, but for single instances)
-                    else
-                    {
-                        string cleanValue = value.Replace(',', '.').Replace(" ", string.Empty);
-                        // 4. سايزسيم به صورت تکی (0.1 تا 5.0)
-                        if (table.Columns.Contains("سايزسيم") && !rowData.ContainsKey("سايزسيم") &&
-                            double.TryParse(cleanValue, NumberStyles.Float, CultureInfo.InvariantCulture, out double size) &&
-                            size >= 0.1 && size <= 5.0 && cleanValue.Length <= 5)
-                        {
-                            rowData["سايزسيم"] = value;
-                            usedValues.Add(value);
-                        }
-                    }
-                }
-
-                // Stage 3: Wire Code and Connector Names (Strings)
-                foreach (var item in sortedGroup)
-                {
-                    string value = item.value.Trim().ToUpper();
-                    if (usedValues.Contains(value)) continue;
-
-                    // 5. کد سیم: (متن ترکیبی)
-                    // Logic: Must contain letters, must not be noise, length is constrained
-                    if (table.Columns.Contains("کدسیم") && !rowData.ContainsKey("کدسیم") &&
-                        value.Length >= 3 && value.Length <= 10 && value.Any(char.IsLetter) &&
-                        !IsNoise(value) && !singleCharColors.Contains(value) && !wireTypePatterns.Contains(value))
-                    {
-                        rowData["کدسیم"] = value;
+                        rowData["نوع سيم"] = matchedPattern;
                         usedValues.Add(value);
-                    }
-
-                    // 6. ابتدا / 7. انتها (اتصال‌دهنده):
-                    // Logic: Must contain letters, length 4-15, not noise, not a wire type/color/code
-                    else if (value.Length >= 4 && value.Length <= 15 && value.Any(char.IsLetter) &&
-                             !IsNoise(value) && !singleCharColors.Contains(value) && !wireTypePatterns.Contains(value) &&
-                             !value.All(c => char.IsDigit(c)))
-                    {
-                        if (table.Columns.Contains("ابتدا") && !rowData.ContainsKey("ابتدا"))
-                        {
-                            rowData["ابتدا"] = value;
-                            usedValues.Add(value);
-                        }
-                        else if (table.Columns.Contains("انتها") && !rowData.ContainsKey("انتها"))
-                        {
-                            rowData["انتها"] = value;
-                            usedValues.Add(value);
-                        }
+                        continue;
                     }
                 }
-
-                // Transfer collected data to the DataTable row
-                foreach (var kvp in rowData)
-                {
-                    row[kvp.Key] = kvp.Value;
-                }
-
-                table.Rows.Add(row);
-                idx++;
             }
         }
 
-        // Save to Excel
+        // Stage 2: numbers (length / size)
+        foreach (var item in sortedGroup)
+        {
+            var rawValue = item.value.Trim().ToUpperInvariant();
+            if (usedValues.Contains(rawValue)) continue;
+
+            if (int.TryParse(rawValue, out var length))
+            {
+                if (table.Columns.Contains("طول برش سيم") && !rowData.ContainsKey("طول برش سيم") &&
+                    length is >= 50 and <= 2500)
+                {
+                    rowData["طول برش سيم"] = rawValue;
+                    usedValues.Add(rawValue);
+                }
+                continue;
+            }
+
+            var cleanValue = rawValue.Replace(',', '.').Replace(" ", string.Empty);
+            if (table.Columns.Contains("سايزسيم") && !rowData.ContainsKey("سايزسيم") &&
+                double.TryParse(cleanValue, NumberStyles.Float, CultureInfo.InvariantCulture, out var size) &&
+                size is >= 0.1 and <= 5.0 && cleanValue.Length <= 5)
+            {
+                rowData["سايزسيم"] = rawValue;
+                usedValues.Add(rawValue);
+            }
+        }
+
+        // Stage 3: wire code and connectors
+        foreach (var item in sortedGroup)
+        {
+            var value = item.value.Trim().ToUpperInvariant();
+            if (usedValues.Contains(value)) continue;
+
+            bool looksLikeCode = value.Length is >= 3 and <= 10 && value.Any(char.IsLetter);
+            bool looksLikeConnector = value.Length is >= 4 and <= 15 && value.Any(char.IsLetter);
+            bool isNoise = IsNoise(value) || SingleCharColors.Contains(value) ||
+                           WireTypePatterns.Any(p => value.Equals(p, StringComparison.OrdinalIgnoreCase));
+
+            if (looksLikeCode && !isNoise && table.Columns.Contains("کدسیم") && !rowData.ContainsKey("کدسیم"))
+            {
+                rowData["کدسیم"] = value;
+                usedValues.Add(value);
+                continue;
+            }
+
+            if (looksLikeConnector && !isNoise && !value.All(char.IsDigit))
+            {
+                if (table.Columns.Contains("ابتدا") && !rowData.ContainsKey("ابتدا"))
+                {
+                    rowData["ابتدا"] = value;
+                    usedValues.Add(value);
+                    continue;
+                }
+
+                if (table.Columns.Contains("انتها") && !rowData.ContainsKey("انتها"))
+                {
+                    rowData["انتها"] = value;
+                    usedValues.Add(value);
+                }
+            }
+        }
+
+        foreach (var kvp in rowData)
+        {
+            row[kvp.Key] = kvp.Value;
+        }
+    }
+
+    private static string CleanText(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
+        var cleaned = Regex.Replace(raw, @"\\(P|H|W|S|T|L|O|U|A|C|F)[^;]*;?", string.Empty);
+        cleaned = cleaned.Replace("\r\n", " ").Replace("\n", " ").Replace("\r", " ");
+        return cleaned.Trim();
+    }
+
+    private static bool IsNoise(string value)
+    {
+        var v = value.ToUpperInvariant();
+        return v.StartsWith("PIN", StringComparison.Ordinal) ||
+               v.EndsWith(":", StringComparison.Ordinal) ||
+               v.Contains("SEAL", StringComparison.Ordinal) ||
+               v.Contains("CLIP", StringComparison.Ordinal) ||
+               v.Contains("AMP", StringComparison.Ordinal) ||
+               v.Contains("YAZAKI", StringComparison.Ordinal) ||
+               v.Contains("KET", StringComparison.Ordinal) ||
+               v.Contains("KUM", StringComparison.Ordinal) ||
+               v.Contains("SWS", StringComparison.Ordinal) ||
+               v.Contains("NOTE", StringComparison.Ordinal) ||
+               v.Contains("SPECIFICATION", StringComparison.Ordinal) ||
+               v.Contains("ASSY", StringComparison.Ordinal) ||
+               v.Contains("DESCRIPTION", StringComparison.Ordinal);
+    }
+
+    private static List<List<(string value, double x, double y)>> GroupByRow(List<(string value, double x, double y)> texts)
+    {
+        const double yTolerance = 5.0;
+        var groups = new List<List<(string value, double x, double y)>>();
+
+        foreach (var text in texts.OrderByDescending(t => t.y).ThenBy(t => t.x))
+        {
+            var group = groups.FirstOrDefault(gr => gr.Any() && Math.Abs(gr.Average(i => i.y) - text.y) <= yTolerance);
+            if (group is null)
+            {
+                groups.Add(new List<(string, double, double)> { text });
+            }
+            else
+            {
+                group.Add(text);
+            }
+        }
+
+        return groups;
+    }
+
+    private static void SaveToExcel(DataTable table, string outputPath)
+    {
         try
         {
-            var outputPath = @"C:\tmp\output.xlsx";
-            using (var wb = new XLWorkbook())
-            {
-                wb.Worksheets.Add(table, "Wires");
-                wb.Worksheet(1).Columns().AdjustToContents();
-                wb.SaveAs(outputPath);
-            }
-            Console.WriteLine("✅ Excel saved as output.xlsx");
-            Console.WriteLine("test");
+            using var workbook = new XLWorkbook();
+            workbook.Worksheets.Add(table, "Wires");
+            workbook.Worksheet(1).Columns().AdjustToContents();
+            workbook.SaveAs(outputPath);
+            Console.WriteLine($"✅ Excel saved as {outputPath}");
         }
         catch (Exception ex)
         {
